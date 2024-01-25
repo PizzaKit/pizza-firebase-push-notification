@@ -4,16 +4,40 @@ import PizzaKit
 import Combine
 import Defaults
 
+public enum PizzaFirebasePushNotificationTopicsManagerError: Error {
+    case notAllTopicsChanged
+}
+
+public typealias PizzaFirebasePushNotificationTopicsManagerPublisher = AnyPublisher<
+    Void,
+    PizzaFirebasePushNotificationTopicsManagerError
+>
+
+public protocol PizzaFirebasePushNotificationTopicsManager {
+    init(allTopics: [String])
+
+    // Текущие подписанные топики
+    var subscribedTopicsPublisher: PizzaRPublisher<Set<String>, Never> { get }
+    // Состояние - загрузка (true) или не загрузка (false)
+    var subscribingLoadingPublisher: PizzaRPublisher<Bool, Never> { get }
+
+    func subscribeAll()
+    func subscribeAllPublisher() -> PizzaFirebasePushNotificationTopicsManagerPublisher
+
+    func unsubscribeAll()
+    func unsubscribeAllPublisher() -> PizzaFirebasePushNotificationTopicsManagerPublisher
+
+    func subscribe(to topic: String)
+    func subscribePublisher(to topic: String) -> PizzaFirebasePushNotificationTopicsManagerPublisher
+
+    func unsubscribe(from topic: String)
+    func unsubscribePublisher(from topic: String) -> PizzaFirebasePushNotificationTopicsManagerPublisher
+}
+
 // TODO: переписать на параллельные подписки (сейчас последовательные)
 // TODO: возможно менять состояние топиков перед подпиской, а потом если ошибка, актуализировать
 // -> так мы на UI сможем реагировать правильно
-public class PizzaFirebasePushNotificationTopicsManager {
-
-    // MARK: - Nested Types
-
-    public enum ManagerError: Error {
-        case notAllTopicsChanged
-    }
+public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNotificationTopicsManager {
 
     // MARK: - Properties
 
@@ -21,11 +45,11 @@ public class PizzaFirebasePushNotificationTopicsManager {
     public var subscribedTopics: Set<String> {
         subscribedTopicsSubject.value
     }
-    public var subscribedTopicsPublisher: AnyPublisher<Set<String>, Never> {
-        subscribedTopicsSubject.eraseToAnyPublisher()
+    public var subscribedTopicsPublisher: PizzaRPublisher<Set<String>, Never> {
+        PizzaCurrentValueRPublisher(subject: subscribedTopicsSubject)
     }
-    public var subscribingLoadingPublisher: AnyPublisher<Bool, Never> {
-        subscribingLoadingSubject.eraseToAnyPublisher()
+    public var subscribingLoadingPublisher: PizzaRPublisher<Bool, Never> {
+        PizzaCurrentValueRPublisher(subject: subscribingLoadingSubject)
     }
     private let subscribedTopicsSubject: CurrentValueSubject<Set<String>, Never>
     private let subscribingLoadingSubject: CurrentValueSubject<Bool, Never> = .init(false)
@@ -34,7 +58,7 @@ public class PizzaFirebasePushNotificationTopicsManager {
 
     // MARK: - Initialization
 
-    public init(allTopics: [String]) {
+    public required init(allTopics: [String]) {
         self.allTopics = Set(allTopics)
         self.subscribedTopicsSubject = .init(Set(Defaults[.subscribedTopics]))
 
@@ -52,24 +76,20 @@ public class PizzaFirebasePushNotificationTopicsManager {
                 )
             }
             .store(in: &bag)
-
-        NotificationCenter.default
-            .publisher(for: .pushTokenUpdated)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] output in
-                guard let self else { return }
-                if !Defaults[.wasFirstTopicsSubscription] {
-                    self.subscribeAllPublisher()
-                        .sink(
-                            receiveCompletion: { _ in },
-                            receiveValue: { _ in
-                                Defaults[.wasFirstTopicsSubscription] = true
-                            }
-                        )
-                        .store(in: &self.bag)
+        
+        // Вдруг уже есть токен (то есть мы инициализировали сервис после того как токен был получен)
+        if Messaging.messaging().apnsToken != nil {
+            checkFirstSubscription()
+        } else {
+            NotificationCenter.default
+                .publisher(for: .pushTokenUpdated)
+                .first()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] output in
+                    self?.checkFirstSubscription()
                 }
-            }
-            .store(in: &bag)
+                .store(in: &bag)
+        }
     }
 
     // MARK: - Methods
@@ -83,7 +103,7 @@ public class PizzaFirebasePushNotificationTopicsManager {
             .store(in: &bag)
     }
 
-    public func subscribeAllPublisher() -> AnyPublisher<Void, ManagerError> {
+    public func subscribeAllPublisher() -> PizzaFirebasePushNotificationTopicsManagerPublisher {
         handle(
             targetTopics: allTopics,
             isSubscription: true
@@ -99,7 +119,7 @@ public class PizzaFirebasePushNotificationTopicsManager {
             .store(in: &bag)
     }
 
-    public func unsubscribeAllPublisher() -> AnyPublisher<Void, ManagerError> {
+    public func unsubscribeAllPublisher() -> PizzaFirebasePushNotificationTopicsManagerPublisher {
         handle(
             targetTopics: allTopics,
             isSubscription: false
@@ -115,7 +135,7 @@ public class PizzaFirebasePushNotificationTopicsManager {
             .store(in: &bag)
     }
 
-    public func subscribePublisher(to topic: String) -> AnyPublisher<Void, ManagerError> {
+    public func subscribePublisher(to topic: String) -> PizzaFirebasePushNotificationTopicsManagerPublisher {
         handle(
             targetTopics: Set([topic]),
             isSubscription: true
@@ -131,7 +151,7 @@ public class PizzaFirebasePushNotificationTopicsManager {
             .store(in: &bag)
     }
 
-    public func unsubscribePublisher(from topic: String) -> AnyPublisher<Void, ManagerError> {
+    public func unsubscribePublisher(from topic: String) -> PizzaFirebasePushNotificationTopicsManagerPublisher {
         handle(
             targetTopics: Set([topic]),
             isSubscription: false
@@ -140,11 +160,24 @@ public class PizzaFirebasePushNotificationTopicsManager {
 
     // MARK: - Private Methods
 
+    private func checkFirstSubscription() {
+        if !Defaults[.wasFirstTopicsSubscription] {
+            subscribeAllPublisher()
+                .sink(
+                    receiveCompletion: { _ in },
+                    receiveValue: { _ in
+                        Defaults[.wasFirstTopicsSubscription] = true
+                    }
+                )
+                .store(in: &bag)
+        }
+    }
+
     private func handle(
         targetTopics: Set<String>,
         isSubscription: Bool
-    ) -> AnyPublisher<Void, ManagerError> {
-        let subject = PassthroughSubject<Void, ManagerError>()
+    ) -> PizzaFirebasePushNotificationTopicsManagerPublisher {
+        let subject = PassthroughSubject<Void, PizzaFirebasePushNotificationTopicsManagerError>()
         subscribingLoadingSubject.send(true)
         let group = DispatchGroup()
 
