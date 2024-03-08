@@ -5,8 +5,12 @@ import Combine
 import Defaults
 
 public enum PizzaFirebasePushNotificationTopicsManagerError: Error {
-    case notAllTopicsChanged(unchanged: Set<String>)
+    case notAllTopicsChanged(
+        notSubscribed: Set<String>,
+        notUnsubscribed: Set<String>
+    )
     case unknownTopic
+    case firebase(Error)
 }
 
 public typealias PizzaFirebasePushNotificationTopicsManagerPublisher = AnyPublisher<
@@ -44,7 +48,14 @@ public protocol PizzaFirebasePushNotificationTopicsManager {
 
 public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNotificationTopicsManager {
 
+    private actor State {
+        var progressSubscribeTopics: [String] = []
+        var progressUnsubscribeTopics: [String] = []
+    }
+
     // MARK: - Properties
+
+    private var state: State = .init()
 
     public let allAvailableTopics: Set<String>
     public let subscribeAtFirstLaunch: Set<String>
@@ -62,25 +73,43 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
         },
         onValueChanged: { newTopics in
             Defaults[.subscribedTopics] = Array(newTopics)
-            PizzaLogger.log(
-                label: "push_topics",
-                level: .info,
-                message: "Topics updated",
-                payload: [
-                    "new_topics": Array(newTopics)
-                ]
-            )
         }
     )
     private let subscribingLoadingSubject: CurrentValueSubject<Bool, Never> = .init(false)
 
     private var bag = Set<AnyCancellable>()
 
+    private var taskQueue = TaskQueue()
+
     // MARK: - Initialization
 
     public required init(allTopics: [String], subscribeAtFirstLaunch: [String]) {
         self.allAvailableTopics = Set(allTopics)
         self.subscribeAtFirstLaunch = Set(subscribeAtFirstLaunch)
+
+        // Логгируем топики (текущие и новые) при изменении
+        subscribedTopicsRWPublisher
+            .withoutCurrentValue
+            .removeDuplicates()
+            .sink { topics in
+                PizzaLogger.log(
+                    label: "push_topics",
+                    level: .info,
+                    message: "Topics updated",
+                    payload: [
+                        "new_topics": Array(topics)
+                    ]
+                )
+            }
+            .store(in: &bag)
+        PizzaLogger.log(
+            label: "push_topics",
+            level: .info,
+            message: "Initial topics",
+            payload: [
+                "topics": Array(subscribedTopicsRWPublisher.value)
+            ]
+        )
 
         // Вдруг уже есть токен (то есть мы инициализировали сервис после того как токен был получен)
         if Messaging.messaging().apnsToken != nil {
@@ -202,7 +231,7 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
     private func handle(
         targetTopics: Set<String>,
         isSubscription: Bool
-    ) -> PizzaFirebasePushNotificationTopicsManagerPublisher {
+    ) async throws {
         let unknownTopics = targetTopics.subtracting(allAvailableTopics)
         guard unknownTopics.isEmpty else {
             PizzaLogger.log(
@@ -213,71 +242,120 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
                     "targetTopics": Array(targetTopics)
                 ]
             )
-            return Fail(
-                outputType: Void.self,
-                failure: PizzaFirebasePushNotificationTopicsManagerError.unknownTopic
-            ).eraseToAnyPublisher()
+            throw PizzaFirebasePushNotificationTopicsManagerError.unknownTopic
         }
 
-        let subject = PassthroughSubject<Void, PizzaFirebasePushNotificationTopicsManagerError>()
-        subscribingLoadingSubject.send(true)
-        let group = DispatchGroup()
-
-        var errorTopics = Set<String>()
-        targetTopics.forEach { topic in
-
-
+        let expectedTargetTopics = {
             if isSubscription {
-                if !subscribedTopicsRWPublisher.value.contains(topic) {
-                    group.enter()
-                    subscribedTopicsRWPublisher.value.insert(topic)
-                    Messaging.messaging().subscribe(
-                        toTopic: topic,
-                        completion: { [weak self] error in
-                            if error != nil {
-                                errorTopics.insert(topic)
-                                self?.subscribedTopicsRWPublisher.value.remove(topic)
-                            }
-                            group.leave()
-                        }
-                    )
-                }
+                return subscribedTopicsRWPublisher.value.union(targetTopics)
             } else {
-                if subscribedTopicsRWPublisher.value.contains(topic) {
-                    group.enter()
-                    subscribedTopicsRWPublisher.value.remove(topic)
-                    Messaging.messaging().unsubscribe(
-                        fromTopic: topic,
-                        completion: { [weak self] error in
-                            if error != nil {
-                                errorTopics.insert(topic)
-                                self?.subscribedTopicsRWPublisher.value.insert(topic)
-                            }
-                            group.leave()
-                        }
-                    )
-                }
+                return subscribedTopicsRWPublisher.value.subtracting(targetTopics)
+            }
+        }()
 
+        for topic in targetTopics {
+            if isSubscription {
+                try await subscribeTo(topic: topic)
+            } else {
+                try await unsubscribeFrom(topic: topic)
             }
         }
 
-        group.notify(queue: .main) { [weak self] in
-            guard let self else { return }
-            if errorTopics.isEmpty {
-                subject.send(())
-                subject.send(completion: .finished)
-            } else {
-                subject.send(
-                    completion: .failure(
-                        .notAllTopicsChanged(
-                            unchanged: errorTopics
-                        )
-                    )
+        let currentTopics = subscribedTopicsRWPublisher.value
+        if currentTopics != expectedTargetTopics {
+            throw PizzaFirebasePushNotificationTopicsManagerError.notAllTopicsChanged(
+                notSubscribed: expectedTargetTopics.subtracting(currentTopics),
+                notUnsubscribed: currentTopics.subtracting(expectedTargetTopics)
+            )
+        }
+    }
+
+    private func subscribeTo(topic: String) async throws {
+        if subscribedTopicsRWPublisher.value.contains(topic) {
+            subscribedTopicsRWPublisher.value.insert(topic)
+            await withCheckedContinuation { cont in
+                Messaging.messaging().subscribe(
+                    toTopic: topic,
+                    completion: { [weak self] _ in
+                        self?.subscribedTopicsRWPublisher.value.insert(topic)
+                        cont.resume()
+                    }
                 )
+            }
+        } else {
+            subscribedTopicsRWPublisher.value.insert(topic)
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                Messaging.messaging().subscribe(
+                    toTopic: topic,
+                    completion: { [weak self] error in
+                        if let error {
+                            self?.subscribedTopicsRWPublisher.value.remove(topic)
+                            cont.resume(throwing: error)
+                        } else {
+                            self?.subscribedTopicsRWPublisher.value.insert(topic)
+                            cont.resume()
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    private func unsubscribeFrom(topic: String) async throws {
+        if !subscribedTopicsRWPublisher.value.contains(topic) {
+            subscribedTopicsRWPublisher.value.remove(topic)
+            await withCheckedContinuation { cont in
+                Messaging.messaging().unsubscribe(
+                    fromTopic: topic,
+                    completion: { [weak self] _ in
+                        self?.subscribedTopicsRWPublisher.value.remove(topic)
+                        cont.resume()
+                    }
+                )
+            }
+        } else {
+            subscribedTopicsRWPublisher.value.remove(topic)
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                Messaging.messaging().unsubscribe(
+                    fromTopic: topic,
+                    completion: { [weak self] error in
+                        if let error {
+                            self?.subscribedTopicsRWPublisher.value.insert(topic)
+                            cont.resume(throwing: error)
+                        } else {
+                            self?.subscribedTopicsRWPublisher.value.remove(topic)
+                            cont.resume()
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    private func handle(
+        targetTopics: Set<String>,
+        isSubscription: Bool
+    ) -> PizzaFirebasePushNotificationTopicsManagerPublisher {
+        let subject = PassthroughSubject<Void, PizzaFirebasePushNotificationTopicsManagerError>()
+
+        taskQueue.dispatch {
+            self.subscribingLoadingSubject.send(true)
+
+            do {
+                try await self.handle(
+                    targetTopics: targetTopics,
+                    isSubscription: isSubscription
+                )
+                subject.send(())
+            } catch let error as PizzaFirebasePushNotificationTopicsManagerError {
+                subject.send(completion: .failure(error))
+            } catch {
+                subject.send(completion: .failure(.firebase(error)))
             }
 
             self.subscribingLoadingSubject.send(false)
         }
+
         return subject.eraseToAnyPublisher()
     }
 
@@ -286,4 +364,38 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
 fileprivate extension Defaults.Keys {
     static let subscribedTopics = Defaults.Key<[String]>("push_firebase_subscribed_topics", default: [])
     static let wasFirstTopicsSubscription = Defaults.Key<Bool>("push_firebase_wasFirstTopicsSubscription", default: false)
+}
+
+private class TaskQueue {
+
+    private actor TaskQueueActor{
+        private var blocks : [() async -> Void] = []
+        private var currentTask : Task<Void,Never>? = nil
+
+        func addBlock(block: @escaping () async -> Void) {
+            blocks.append(block)
+            next()
+        }
+
+        func next() {
+            if (currentTask != nil) {
+                return
+            }
+            if (!blocks.isEmpty) {
+                let block = blocks.removeFirst()
+                currentTask = Task {
+                    await block()
+                    currentTask = nil
+                    next()
+                }
+            }
+        }
+    }
+    private let taskQueueActor = TaskQueueActor()
+
+    func dispatch(block: @escaping () async ->Void) {
+        Task{
+            await taskQueueActor.addBlock(block: block)
+        }
+    }
 }
