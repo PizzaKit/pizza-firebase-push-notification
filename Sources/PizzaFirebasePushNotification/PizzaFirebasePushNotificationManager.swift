@@ -18,8 +18,18 @@ public class PizzaFirebasePushNotificationManager: NSObject, MessagingDelegate, 
 
         UNUserNotificationCenter.current().delegate = self
         Messaging.messaging().delegate = self
-        UIApplication.shared.registerForRemoteNotifications()
-        PizzaPushNotificationsPermissionHelper.requestAuthorization(completion: nil)
+        PizzaPushNotificationsPermissionHelper.requestAuthorization { _ in
+            self.checkPermission()
+        }
+
+        NotificationCenter
+            .default
+            .publisher(for: UIApplication.didBecomeActiveNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.checkPermission()
+            }
+            .store(in: &bag)
     }
 
     // MARK: - PizzaPushNotificationManager
@@ -99,6 +109,18 @@ public class PizzaFirebasePushNotificationManager: NSObject, MessagingDelegate, 
         UIApplication.shared.applicationIconBadgeNumber = 0
 
         completionHandler()
+    }
+
+    // MARK: - Private Methods
+
+    private func checkPermission() {
+        PizzaPushNotificationsPermissionHelper.getCurrentPermission { isGranted in
+            if isGranted {
+                DispatchQueue.main.async {
+                    UIApplication.shared.registerForRemoteNotifications()
+                }
+            }
+        }
     }
 
 }

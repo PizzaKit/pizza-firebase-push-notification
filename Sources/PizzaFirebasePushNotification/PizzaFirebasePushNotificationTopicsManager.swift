@@ -13,6 +13,7 @@ public enum PizzaFirebasePushNotificationTopicsManagerError: Error {
     case firebase(Error)
 }
 
+// TODO: subscribeAtFirstLaunch тоже подписаться
 public typealias PizzaFirebasePushNotificationTopicsManagerPublisher = AnyPublisher<
     Void,
     PizzaFirebasePushNotificationTopicsManagerError
@@ -48,6 +49,7 @@ public protocol PizzaFirebasePushNotificationTopicsManager {
 
 public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNotificationTopicsManager {
 
+    private typealias ManagerError = PizzaFirebasePushNotificationTopicsManagerError
     private actor State {
         var progressSubscribeTopics: [String] = []
         var progressUnsubscribeTopics: [String] = []
@@ -92,6 +94,7 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
             .withoutCurrentValue
             .removeDuplicates()
             .sink { topics in
+//                print("$$$ current topics \(topics)")
                 PizzaLogger.log(
                     label: "push_topics",
                     level: .info,
@@ -111,18 +114,39 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
             ]
         )
 
-        // Вдруг уже есть токен (то есть мы инициализировали сервис после того как токен был получен)
-        if Messaging.messaging().apnsToken != nil {
-            checkFirstSubscription()
-        } else {
+        let completion: () -> Void = { [weak self] in
+            guard let self else { return }
+
+            self.refreshSubscriptions()
             NotificationCenter.default
                 .publisher(for: .pushTokenUpdated)
-                .first()
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] output in
-                    self?.checkFirstSubscription()
+                    self?.refreshSubscriptions()
+                }
+                .store(in: &self.bag)
+
+            NotificationCenter
+                .default
+                .publisher(for: UIApplication.didBecomeActiveNotification)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.refreshSubscriptions()
+                }
+                .store(in: &self.bag)
+        }
+
+        if !Defaults[.wasFirstTopicsSubscription] {
+            subscribePublisher(to: subscribeAtFirstLaunch)
+                .receive(on: DispatchQueue.main)
+                .sink { _ in
+                    completion()
+                } receiveValue: { _ in
+                    Defaults[.wasFirstTopicsSubscription] = true
                 }
                 .store(in: &bag)
+        } else {
+            completion()
         }
     }
 
@@ -215,16 +239,34 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
 
     // MARK: - Private Methods
 
-    private func checkFirstSubscription() {
-        if !Defaults[.wasFirstTopicsSubscription] && !subscribeAtFirstLaunch.isEmpty {
-            subscribePublisher(to: Array(subscribeAtFirstLaunch))
-                .sink(
-                    receiveCompletion: { _ in },
-                    receiveValue: { _ in
-                        Defaults[.wasFirstTopicsSubscription] = true
-                    }
-                )
-                .store(in: &bag)
+    private func refreshSubscriptions() {
+        PizzaPushNotificationsPermissionHelper.getCurrentPermission { [weak self] isGranted in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if
+                    isGranted,
+                    !Defaults[.wasResubscribedAfterPermissionGranted],
+                    Messaging.messaging().apnsToken != nil
+                {
+                    let subscribeTopics = Array(self.subscribedTopicsRWPublisher.value)
+                    self.unsubscribeAllPublisher()
+                        .flatMap { [weak self] _ -> AnyPublisher<Void, ManagerError> in
+                            guard let self else {
+                                return Empty().eraseToAnyPublisher()
+                            }
+                            return self.subscribePublisher(to: subscribeTopics)
+                        }
+                        .receive(on: DispatchQueue.main)
+                        .sink { _ in
+                        } receiveValue: { [weak self] _ in
+                            Defaults[.wasResubscribedAfterPermissionGranted] = true
+                        }
+                        .store(in: &self.bag)
+                }
+                if isGranted == false {
+                    Defaults[.wasResubscribedAfterPermissionGranted] = false
+                }
+            }
         }
     }
 
@@ -242,7 +284,7 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
                     "targetTopics": Array(targetTopics)
                 ]
             )
-            throw PizzaFirebasePushNotificationTopicsManagerError.unknownTopic
+            throw ManagerError.unknownTopic
         }
 
         let expectedTargetTopics = {
@@ -263,7 +305,7 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
 
         let currentTopics = subscribedTopicsRWPublisher.value
         if currentTopics != expectedTargetTopics {
-            throw PizzaFirebasePushNotificationTopicsManagerError.notAllTopicsChanged(
+            throw ManagerError.notAllTopicsChanged(
                 notSubscribed: expectedTargetTopics.subtracting(currentTopics),
                 notUnsubscribed: currentTopics.subtracting(expectedTargetTopics)
             )
@@ -271,63 +313,93 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
     }
 
     private func subscribeTo(topic: String) async throws {
+//        print("$$$ subscribe to \(topic)")
         if subscribedTopicsRWPublisher.value.contains(topic) {
             subscribedTopicsRWPublisher.value.insert(topic)
             await withCheckedContinuation { cont in
-                Messaging.messaging().subscribe(
-                    toTopic: topic,
-                    completion: { [weak self] _ in
-                        self?.subscribedTopicsRWPublisher.value.insert(topic)
+                PizzaPushNotificationsPermissionHelper.getCurrentPermission { isGranted in
+                    if isGranted && Messaging.messaging().apnsToken != nil {
+//                        print("$$$ real subscribe to \(topic)")
+                        Messaging.messaging().subscribe(
+                            toTopic: topic,
+                            completion: { [weak self] _ in
+                                self?.subscribedTopicsRWPublisher.value.insert(topic)
+                                cont.resume()
+                            }
+                        )
+                    } else {
                         cont.resume()
                     }
-                )
+                }
             }
         } else {
             subscribedTopicsRWPublisher.value.insert(topic)
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                Messaging.messaging().subscribe(
-                    toTopic: topic,
-                    completion: { [weak self] error in
-                        if let error {
-                            self?.subscribedTopicsRWPublisher.value.remove(topic)
-                            cont.resume(throwing: error)
-                        } else {
-                            self?.subscribedTopicsRWPublisher.value.insert(topic)
-                            cont.resume()
-                        }
+                PizzaPushNotificationsPermissionHelper.getCurrentPermission { isGranted in
+                    if isGranted && Messaging.messaging().apnsToken != nil {
+//                        print("$$$ real subscribe to \(topic)")
+                        Messaging.messaging().subscribe(
+                            toTopic: topic,
+                            completion: { [weak self] error in
+                                if let error {
+                                    self?.subscribedTopicsRWPublisher.value.remove(topic)
+                                    cont.resume(throwing: error)
+                                } else {
+                                    self?.subscribedTopicsRWPublisher.value.insert(topic)
+                                    cont.resume()
+                                }
+                            }
+                        )
+                    } else {
+                        cont.resume()
                     }
-                )
+                }
             }
         }
     }
 
     private func unsubscribeFrom(topic: String) async throws {
+//        print("$$$ unsubscribe from \(topic)")
         if !subscribedTopicsRWPublisher.value.contains(topic) {
             subscribedTopicsRWPublisher.value.remove(topic)
             await withCheckedContinuation { cont in
-                Messaging.messaging().unsubscribe(
-                    fromTopic: topic,
-                    completion: { [weak self] _ in
-                        self?.subscribedTopicsRWPublisher.value.remove(topic)
+                PizzaPushNotificationsPermissionHelper.getCurrentPermission { isGranted in
+                    if isGranted && Messaging.messaging().apnsToken != nil {
+//                        print("$$$ real unsubscribe from \(topic)")
+                        Messaging.messaging().unsubscribe(
+                            fromTopic: topic,
+                            completion: { [weak self] _ in
+                                self?.subscribedTopicsRWPublisher.value.remove(topic)
+                                cont.resume()
+                            }
+                        )
+                    } else {
                         cont.resume()
                     }
-                )
+                }
             }
         } else {
             subscribedTopicsRWPublisher.value.remove(topic)
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                Messaging.messaging().unsubscribe(
-                    fromTopic: topic,
-                    completion: { [weak self] error in
-                        if let error {
-                            self?.subscribedTopicsRWPublisher.value.insert(topic)
-                            cont.resume(throwing: error)
-                        } else {
-                            self?.subscribedTopicsRWPublisher.value.remove(topic)
-                            cont.resume()
-                        }
+                PizzaPushNotificationsPermissionHelper.getCurrentPermission { isGranted in
+                    if isGranted && Messaging.messaging().apnsToken != nil {
+//                        print("$$$ real unsubscribe from \(topic)")
+                        Messaging.messaging().unsubscribe(
+                            fromTopic: topic,
+                            completion: { [weak self] error in
+                                if let error {
+                                    self?.subscribedTopicsRWPublisher.value.insert(topic)
+                                    cont.resume(throwing: error)
+                                } else {
+                                    self?.subscribedTopicsRWPublisher.value.remove(topic)
+                                    cont.resume()
+                                }
+                            }
+                        )
+                    } else {
+                        cont.resume()
                     }
-                )
+                }
             }
         }
     }
@@ -336,7 +408,7 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
         targetTopics: Set<String>,
         isSubscription: Bool
     ) -> PizzaFirebasePushNotificationTopicsManagerPublisher {
-        let subject = PassthroughSubject<Void, PizzaFirebasePushNotificationTopicsManagerError>()
+        let subject = PassthroughSubject<Void, ManagerError>()
 
         taskQueue.dispatch {
             self.subscribingLoadingSubject.send(true)
@@ -347,7 +419,8 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
                     isSubscription: isSubscription
                 )
                 subject.send(())
-            } catch let error as PizzaFirebasePushNotificationTopicsManagerError {
+                subject.send(completion: .finished)
+            } catch let error as ManagerError {
                 subject.send(completion: .failure(error))
             } catch {
                 subject.send(completion: .failure(.firebase(error)))
@@ -364,6 +437,7 @@ public class PizzaFirebasePushNotificationTopicsManagerImpl: PizzaFirebasePushNo
 fileprivate extension Defaults.Keys {
     static let subscribedTopics = Defaults.Key<[String]>("push_firebase_subscribed_topics", default: [])
     static let wasFirstTopicsSubscription = Defaults.Key<Bool>("push_firebase_wasFirstTopicsSubscription", default: false)
+    static let wasResubscribedAfterPermissionGranted = Defaults.Key<Bool>("push_firebase_wasResubscribedAfterPermissionGranted", default: false)
 }
 
 private class TaskQueue {
